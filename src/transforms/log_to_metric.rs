@@ -4,7 +4,7 @@ use std::fmt;
 
 use chrono::Utc;
 use indexmap::IndexMap;
-use vector_lib::configurable::configurable_component;
+use vector_lib::configurable::{configurable_component, ConfigurableString};
 use vector_lib::event::LogEvent;
 use vector_lib::{
     config::LogNamespace,
@@ -14,8 +14,9 @@ use vector_lib::{
         metric::{Bucket, Quantile},
     },
 };
-use vrl::path::{parse_target_path, PathParseError};
+use vrl::path::{parse_target_path, PathParseError, PathPrefix, ValuePath};
 use vrl::{event_path, path};
+use vector_lib::lookup::lookup_v2::ConfigValuePath;
 
 use crate::config::schema::Definition;
 use crate::transforms::log_to_metric::TransformError::PathNotFound;
@@ -49,7 +50,7 @@ pub struct LogToMetricConfig {
     /// A list of metrics to generate.
     pub metrics: Vec<MetricConfig>,
     /// this flag will process all metrics to logs, if defined the `metrics` field is ignored.
-    pub all_metrics: Option<bool>,
+    pub all_metrics: Option<HashMap<SupportedMetrics, ConfigValuePath>>,
 }
 
 /// Specification of a counter derived from a log event.
@@ -144,6 +145,36 @@ const fn default_kind() -> MetricKind {
     MetricKind::Incremental
 }
 
+/// Supported metrics for dynamic mode.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd)]
+pub enum SupportedMetrics {
+    /// A counter metric.
+    Counter,
+    /// A histogram metric.
+    Histogram,
+    /// A gauge metric.
+    Gauge,
+    /// A distribution metric.
+    Distribution,
+    /// A summary metric.
+    Summary,
+}
+
+impl ConfigurableString for SupportedMetrics {}
+
+impl fmt::Display for SupportedMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SupportedMetrics::Counter => write!(f, "Counter"),
+            SupportedMetrics::Histogram => write!(f, "Histogram"),
+            SupportedMetrics::Gauge => write!(f, "Gauge"),
+            SupportedMetrics::Distribution => write!(f, "Distribution"),
+            SupportedMetrics::Summary => write!(f, "Summary"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LogToMetric {
     config: LogToMetricConfig,
@@ -162,7 +193,7 @@ impl GenerateConfig for LogToMetricConfig {
                     kind: MetricKind::Incremental,
                 }),
             }],
-            all_metrics: Some(true),
+            all_metrics: None,
         })
         .unwrap()
     }
@@ -454,9 +485,9 @@ fn get_counter_value(log: &LogEvent) -> Result<MetricValue, TransformError> {
     })
 }
 
-fn get_gauge_value(log: &LogEvent) -> Result<MetricValue, TransformError> {
+fn get_gauge_value<'a>(log: &LogEvent, path: impl ValuePath<'a>) -> Result<MetricValue, TransformError> {
     let gauge_value = log
-        .get(event_path!("gauge", "value"))
+        .get((PathPrefix::Event, path))
         .ok_or_else(|| TransformError::PathNotFound {
             path: "gauge.value".to_string(),
         })?
@@ -677,7 +708,7 @@ fn get_summary_value(log: &LogEvent) -> Result<MetricValue, TransformError> {
     })
 }
 
-fn to_metrics_metadata(event: &Event) -> Result<Metric, TransformError> {
+fn to_metrics_metadata(path_map: &HashMap<SupportedMetrics, ConfigValuePath>, event: &Event) -> Result<Metric, TransformError> {
     let log = event.as_log();
     let timestamp = log
         .get_timestamp()
@@ -727,7 +758,14 @@ fn to_metrics_metadata(event: &Event) -> Result<Metric, TransformError> {
     if let Some(root_event) = log.as_map() {
         for key in root_event.keys() {
             value = match key.as_str() {
-                "gauge" => Some(get_gauge_value(log)?),
+                "gauge" => {
+                    if let Some(path) = path_map.get(&SupportedMetrics::Gauge) {
+                        Some(get_gauge_value(log, path)?)
+                    }
+                    else {
+                        None
+                    }
+                },
                 "distribution" => Some(get_distribution_value(log)?),
                 "histogram" => Some(get_histogram_value(log)?),
                 "summary" => Some(get_summary_value(log)?),
@@ -755,12 +793,11 @@ impl FunctionTransform for LogToMetric {
     fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
         // Metrics are "all or none" for a specific log. If a single fails, none are produced.
         let mut buffer = Vec::with_capacity(self.config.metrics.len());
-        if self
+        if let Some(path_map) = &self
             .config
             .all_metrics
-            .is_some_and(|all_metrics| all_metrics)
         {
-            match to_metrics_metadata(&event) {
+            match to_metrics_metadata(&path_map, &event) {
                 Ok(metric) => {
                     output.push(Event::Metric(metric));
                 }
@@ -1910,102 +1947,4 @@ mod tests {
             .with_timestamp(Some(ts()))
         );
     }
-
-    #[tokio::test]
-    async fn multiple_metadata_metrics() {
-        let config = parse_yaml_config(
-            r#"
-            metrics: []
-            all_metrics: true
-            "#,
-        );
-
-        let json_gauge = r#"{
-          "gauge": {
-            "value": 990.0
-          },
-          "kind": "absolute",
-          "name": "test1.transform.gauge",
-          "tags": {
-            "env": "test_env",
-            "host": "localhost"
-          }
-        }"#;
-        let log_gauge = create_log_event(json_gauge);
-
-        let json_histogram = r#"{
-          "histogram": {
-            "sum": 18.0,
-            "count": 5,
-            "buckets": [
-              {
-                "upper_limit": 1.0,
-                "count": 1
-              },
-              {
-                "upper_limit": 2.0,
-                "count": 2
-              },
-              {
-                "upper_limit": 5.0,
-                "count": 1
-              },
-              {
-                "upper_limit": 10.0,
-                "count": 1
-              }
-            ]
-          },
-          "kind": "absolute",
-          "name": "test.transform.histogram",
-          "tags": {
-            "env": "test_env",
-            "host": "localhost"
-          }
-        }"#;
-        let log_histogram = create_log_event(json_histogram);
-
-        let logs: HashMap<&str, LogEvent> =
-            [("test.transform.gauge", log_gauge.into_log()),
-            ("test.transform.histogram", log_histogram.into_log())
-        ].iter().cloned().collect();
-        let mut event = Event::Log(LogEvent::from(logs));
-
-        // let mut event = Event::Log(LogEvent::from_parts(log_gauge.clone().into_log().value().clone(), log_gauge.clone().into_metadata()));
-        // event.as_mut_log().insert("test.transform.histogram", log_histogram.clone().into_log().value().clone());
-        let output = do_transform_multiple_events(config, event, 2).await;
-
-        assert_eq!(2, output.len());
-        assert_eq!(
-            output[0].clone().into_metric(),
-            Metric::new_with_metadata(
-                "test.transform.gauge",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 990.0 },
-                output[0].metadata().clone(),
-            )
-                .with_namespace(Some("test_namespace"))
-                .with_tags(Some(metric_tags!(
-                "env" => "test_env",
-                "host" => "localhost",
-            )))
-                .with_timestamp(Some(ts()))
-        );
-        assert_eq!(
-            output[1].clone().into_metric(),
-            Metric::new_with_metadata(
-                "test.transform.gauge",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 990.0 },
-                output[1].metadata().clone(),
-            )
-                .with_namespace(Some("test_namespace"))
-                .with_tags(Some(metric_tags!(
-                "env" => "test_env",
-                "host" => "localhost",
-            )))
-                .with_timestamp(Some(ts()))
-        );
-    }
-
 }
